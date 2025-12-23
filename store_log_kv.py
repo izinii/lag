@@ -277,9 +277,10 @@ def store_reasoning_last_action(dataset: str):
 
 
 # ---------------------------------------------------------------------------
-# --------------------------- NEW IMPLEMENTATION ----------------------------
+# ------------------------ NEW METHODS IMPLEMENTED --------------------------
 # ---------------------------------------------------------------------------
 
+# --- Store kv of last k rounds actions ---
 def store_reasoning_last_k_actions(dataset: str, last_k: int):
   '''Encode all reasoning traces, store the KV values corresponding to the last k agentic actions in the reasoning trace'''
   # Instead of slicing KV for one [start_idx:end_idx] span, we slice KV for k spans and concatenate them (in order).
@@ -346,6 +347,53 @@ def store_reasoning_last_k_actions(dataset: str, last_k: int):
     log_kvs.append(kv)
 
   write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_k}_actions.pkl') # save the KV caches to disk as pickle files
+
+
+# --------------------------------------------------------------
+
+# --- Get the last k rounds response and select S KVs randomly (per-layer) ---
+def store_reasoning_offline_randomness(dataset, last_num: int, S: int):
+  '''The default storage strategy: Encode all reasoning traces, store the KV values corresponding to the last_num reasoning trace
+  (e.g., if last_num = 2, store the KV values corresponding to tokens in the last two reasoning traces)
+  *** BUT randomly sample S keys/values from the last N responses per layer ***
+  '''
+
+  model_id = 'meta-llama/Llama-3.1-8B-Instruct'
+  tokenizer = AutoTokenizer.from_pretrained(model_id)
+  model = AutoModelForCausalLM.from_pretrained(model_id, device_map='auto', torch_dtype=torch.bfloat16)
+  config: LlamaConfig = AutoConfig.from_pretrained(pretrained_model_name_or_path=model_id)
+  emb: LlamaRotaryEmbedding = LlamaRotaryEmbedding(config=config).to(device=model.device, dtype=torch.float32)
+
+  logs = read_json(f'./data/{dataset}/preds/log.json')
+  log_kvs = []
+
+  for log in tqdm(logs):
+    log = log[0]
+    kv = get_reasoning_kv(log, tokenizer, model, emb, last_num)
+    # At this point: kv.key_cache[layer].shape = (1, H, T, D) and T = number of tokens in last k responses
+
+    # RANDOMLY sample S keys/values from the last N responses per layer
+    total_tokens = kv._seen_tokens
+    assert total_tokens == kv.key_cache[0].shape[2]
+    if S < total_tokens:
+      sampled_indices = torch.randperm(total_tokens)[:S].sort().values  # randomly sample S unique indices and sort them
+      kv._seen_tokens = S
+      num_layers = len(kv)
+      for layer_idx in range(num_layers):
+        kv.key_cache[layer_idx] = kv.key_cache[layer_idx][:, :, sampled_indices, :].clone().contiguous()
+        kv.value_cache[layer_idx] = kv.value_cache[layer_idx][:, :, sampled_indices, :].clone().contiguous()
+        assert kv.key_cache[layer_idx].shape == kv.value_cache[layer_idx].shape
+        assert kv.key_cache[layer_idx].shape[2] == S
+    else:
+      # if S >= total_tokens, keep all tokens
+      kv._seen_tokens = total_tokens # not mandatory, but just in case 
+
+    log_kvs.append(kv)
+
+  write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_num}_randomness_{S}.pkl') # save the KV caches to disk as pickle files
+
+
+
 
 
 
