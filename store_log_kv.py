@@ -12,6 +12,7 @@ import argparse
 from block_attention import apply_pkv_rerotary_position_embeddings
 from utils import STORE_PREFIX
 
+
 # --- UTILS ---
 def get_log_kv(text, tokenizer, model, emb):
   '''Convert text into KV cache, while removing positional bias'''
@@ -213,9 +214,8 @@ def store_reasoning_last_action(dataset: str):
   log_kvs = []
 
   for log in tqdm(logs):
-    # use only assistant messages
-    log = [x for i, x in enumerate(log[0]) if i % 2 == 1]
-    action = extract_action(log[-1]).replace('<|eot_id|>', '')
+    log = [x for i, x in enumerate(log[0]) if i % 2 == 1] # use only assistant messages
+    action = extract_action(log[-1]).replace('<|eot_id|>', '') # extract last action
     
     # rsplit so we are splitting on the last "last action" (if it was repeated multiple times)
     assert len(log[-1].rsplit(action, 1)) <= 2
@@ -225,7 +225,7 @@ def store_reasoning_last_action(dataset: str):
       # remove the newlines right before and after action
       # (adding the newline right in front of action so it's possible to extract the action)
       # \n seems to be independent from <
-      # but \n sticks to the end of >, sp >\n\n is a token
+      # but \n sticks to the end of >, so >\n\n is a token
       log_last = log_last[0].rstrip() + '\n' + action + '\n\n' + log_last[1].lstrip()
     # Case B — Action is the whole message
     else:
@@ -263,7 +263,6 @@ def store_reasoning_last_action(dataset: str):
     for layer_idx in range(num_layers):
       # for every layer, we throw away the KV values of all the tokens before and after the last action and only keep the tokens of the last action
       # slicing only return view, not changing the original tensor
-      # pickle saves the underlying storage
       kv.key_cache[layer_idx] = kv.key_cache[layer_idx][:, :, start_idx:end_idx, :].clone().contiguous() 
       kv.value_cache[layer_idx] = kv.value_cache[layer_idx][:, :, start_idx:end_idx, :].clone().contiguous()
       assert kv.key_cache[layer_idx].shape == kv.value_cache[layer_idx].shape
@@ -306,6 +305,7 @@ def store_reasoning_last_k_actions(dataset: str, last_k: int):
 
     log_last = log[-1].replace('<|eot_id|>', '') # rebuild last message so that all actions appear cleanly and once
 
+    # for each action, rsplit so we are splitting on the last occurrence of that action
     for action in actions:
       assert len(log_last.rsplit(action, 1)) <= 2
       if action in log_last:
@@ -369,7 +369,8 @@ def store_reasoning_offline_randomness(dataset, last_num: int, S: int):
   for log in tqdm(logs):
     log = log[0]
     kv = get_reasoning_kv(log, tokenizer, model, emb, last_num)
-    # At this point: kv.key_cache[layer].shape = (1, H, T, D) and T = number of tokens in last k responses
+    # At this point: kv.key_cache[layer].shape = (1, H, T, D)
+    # 1 = batch size, H = number of heads, T = number of tokens in last k responses, D = head_dim 
 
     # RANDOMLY sample S keys/values from the last N responses per layer
     total_tokens = kv._seen_tokens
@@ -434,10 +435,10 @@ def store_reasoning_offline_topS(dataset: str, last_num: int, S: int):
         # Forward pass WITH attentions
         with torch.no_grad():
             outputs = model(input_ids=input_ids, use_cache=True, output_attentions=True)
-        kv = outputs.past_key_values # shape: (1, heads, T, head_dim)
-        attentions = outputs.attentions  # shape: (1, heads, T, T)
+        kv = outputs.past_key_values # shape: list of (k, v) tuples per layer and every k/v shape: (1, heads, T, head_dim)
+        attentions = outputs.attentions  # shape: list of attention tensors per layer and every attention shape: (1, heads, T, T)
 
-         # find the token start and end_idx corresponding to the last action
+        # find the token start and end_idx corresponding to the last action
         input_ids_action = tokenizer.encode(action + '\n\n', return_tensors='pt', add_special_tokens=False) # action + \n\n
         input_ids_last = tokenizer.encode(log_last, return_tensors='pt', add_special_tokens=False) # last message
         input_ids_except_last = tokenizer.encode(log_except_last + '\n\n', return_tensors='pt', add_special_tokens=False) # all except last message
@@ -457,43 +458,46 @@ def store_reasoning_offline_topS(dataset: str, last_num: int, S: int):
         last_k_start = input_ids.shape[1] - input_ids_last_k.shape[0]
         last_k_end   = input_ids.shape[1]
 
-
         num_layers = len(kv)
         new_kv = []
         for layer_idx in range(num_layers):
             attn = attentions[layer_idx][0]  # (H, T, T)
+            # For this layer: attn[h, i, j] = attention weight from query token i to key token j for head h
 
-            # restrict attention: action → last-k
-            attn_slice = attn[:, action_start:action_end, last_k_start:last_k_end]  # (H, A, K)
+            # slicing attention / restrict attention: action → last-k
+            attn_slice = attn[:, action_start:action_end, last_k_start:last_k_end]  # (H, A, K) 
+            # A = number of tokens in the last action, K = number of tokens in last k responses
+            # For each head: for each action token, how much it attends to each token in the last k rounds
 
             # aggregate → one score per last-k token
             scores = attn_slice.mean(dim=0).mean(dim=0)  # (K,)
+            # Removes the head dimension (Average attention over all heads) and Removes the action token dimension (Average attention over all tokens of the last action)
+            # we get: how important this past token (from last k rounds) was, on average, for producing the final action in this layer
 
             K = scores.shape[0]
             if S < K:
-                top_idx = torch.topk(scores, S).indices
-                top_idx, _ = torch.sort(top_idx)
+                top_idx = torch.topk(scores, S).indices # indices of top-S attentive tokens
+                top_idx, _ = torch.sort(top_idx) # sort to maintain original order
             else:
-                top_idx = torch.arange(K)
+                top_idx = torch.arange(K) # keep all tokens as before 
 
-            global_idx = top_idx + last_k_start
+            global_idx = top_idx + last_k_start # adjust to global indices in the full reasoning trace
 
-            k_layer, v_layer = kv[layer_idx]
+            k_layer, v_layer = kv[layer_idx] # Extract K and V tensors for this layer
             k_sel = k_layer[:, :, global_idx, :].clone().contiguous()
             v_sel = v_layer[:, :, global_idx, :].clone().contiguous()
 
             new_kv.append((k_sel.cpu(), v_sel.cpu()))
 
         # Build DynamicCache-compatible object
-        kv_out = type(kv)()
-        kv_out.key_cache   = [k for k, _ in new_kv]
-        kv_out.value_cache = [v for _, v in new_kv]
-        kv_out._seen_tokens = len(new_kv[0][0][0, 0])
+        kv_out = type(kv)() # create empty DynamicCache
+        kv_out.key_cache   = [k for k, _ in new_kv] # list of selected keys per layer
+        kv_out.value_cache = [v for _, v in new_kv] # list of selected values per layer
+        kv_out._seen_tokens = len(new_kv[0][0][0, 0]) # number of tokens stored (should be S or less)
 
         log_kvs.append(kv_out)
 
     write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_num}_topS_{S}.pkl')
-
 
 
 if __name__ == '__main__':
