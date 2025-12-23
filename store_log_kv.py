@@ -276,6 +276,7 @@ def store_reasoning_last_action(dataset: str):
   write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_action.pkl') # save the KV caches to disk as pickle files
 
 
+
 # ---------------------------------------------------------------------------
 # ------------------------ NEW METHODS IMPLEMENTED --------------------------
 # ---------------------------------------------------------------------------
@@ -349,8 +350,6 @@ def store_reasoning_last_k_actions(dataset: str, last_k: int):
   write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_k}_actions.pkl') # save the KV caches to disk as pickle files
 
 
-# --------------------------------------------------------------
-
 # --- Get the last k rounds response and select S KVs randomly (per-layer) ---
 def store_reasoning_offline_randomness(dataset, last_num: int, S: int):
   '''The default storage strategy: Encode all reasoning traces, store the KV values corresponding to the last_num reasoning trace
@@ -393,9 +392,107 @@ def store_reasoning_offline_randomness(dataset, last_num: int, S: int):
   write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_num}_randomness_{S}.pkl') # save the KV caches to disk as pickle files
 
 
+# --- Get the last k rounds response and select the top-S KVs (per-layer) based on the attention to the last action ---
+def store_reasoning_offline_topS(dataset: str, last_num: int, S: int):
+    '''Encode all reasoning traces, keep KV of the last `last_num` rounds, then select top-S KV tokens per layer based on attention to the last action.'''
+
+    model_id = 'meta-llama/Llama-3.1-8B-Instruct'
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, device_map='auto', torch_dtype=torch.bfloat16)
+    config: LlamaConfig = AutoConfig.from_pretrained(pretrained_model_name_or_path=model_id)
+    emb: LlamaRotaryEmbedding = LlamaRotaryEmbedding(config=config).to(device=model.device, dtype=torch.float32)
+
+    logs = read_json(f'./data/{dataset}/preds/log.json')
+    log_kvs = []
+
+    for log in tqdm(logs):
+        log = [x for i, x in enumerate(log[0]) if i % 2 == 1] # use only assistant messages
+        action = extract_action(log[-1]).replace('<|eot_id|>', '') # extract last action
+        
+        # rsplit so we are splitting on the last "last action" (if it was repeated multiple times)
+        assert len(log[-1].rsplit(action, 1)) <= 2
+        # Case A — if not the entire reasoning trace, meaning action is embedded in a longer message
+        if action != log[-1].replace('<|eot_id|>', ''):
+          log_last: str = log[-1].rsplit(action, 1)
+          # remove the newlines right before and after action
+          # (adding the newline right in front of action so it's possible to extract the action)
+          # \n seems to be independent from <
+          # but \n sticks to the end of >, sp >\n\n is a token
+          log_last = log_last[0].rstrip() + '\n' + action + '\n\n' + log_last[1].lstrip()
+        # Case B — Action is the whole message
+        else:
+          log_last = log[-1].replace(action, action + '\n\n') # Still appends \n\n so tokenization is consistent
+        
+        # Rebuild the full reasoning trace
+        log_last = log_last.replace('<|eot_id|>', '')
+        log_except_last = '\n\n'.join(log[:-1]).replace('<|eot_id|>', '')
+        reasoning_trace = log_except_last + '\n\n' + log_last
+        assert '<|eot_id|>' not in reasoning_trace
+
+        input_ids = tokenizer.encode(reasoning_trace, return_tensors='pt', add_special_tokens=False).to(model.device) # tokenize for attention computation
+
+        # Forward pass WITH attentions
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, use_cache=True, output_attentions=True)
+        kv = outputs.past_key_values # shape: (1, heads, T, head_dim)
+        attentions = outputs.attentions  # shape: (1, heads, T, T)
+
+         # find the token start and end_idx corresponding to the last action
+        input_ids_action = tokenizer.encode(action + '\n\n', return_tensors='pt', add_special_tokens=False) # action + \n\n
+        input_ids_last = tokenizer.encode(log_last, return_tensors='pt', add_special_tokens=False) # last message
+        input_ids_except_last = tokenizer.encode(log_except_last + '\n\n', return_tensors='pt', add_special_tokens=False) # all except last message
+
+        # Find the exact tokens sequence corresponding to the last action inside the last assistant message
+        action_start, action_end = sublist_indices(input_ids_last[0], input_ids_action[0]) # find the start and end_idx in the last message
+
+        # from input_ids_last, find the start and end_idx corresponding to input_ids_action
+        # then add it to the start_idx of input_ids_last
+        action_start += input_ids_except_last.shape[0]
+        action_end   += input_ids_except_last.shape[0]
+
+        # last-k responses span
+        assistant_logs = [x for i, x in enumerate(log) if i % 2 == 1]
+        last_k_text = '\n\n'.join(assistant_logs[-last_num:]).replace('<|eot_id|>', '') + '\n\n'
+        input_ids_last_k = tokenizer.encode(last_k_text, return_tensors='pt', add_special_tokens=False)[0]
+        last_k_start = input_ids.shape[1] - input_ids_last_k.shape[0]
+        last_k_end   = input_ids.shape[1]
 
 
+        num_layers = len(kv)
+        new_kv = []
+        for layer_idx in range(num_layers):
+            attn = attentions[layer_idx][0]  # (H, T, T)
 
+            # restrict attention: action → last-k
+            attn_slice = attn[:, action_start:action_end, last_k_start:last_k_end]  # (H, A, K)
+
+            # aggregate → one score per last-k token
+            scores = attn_slice.mean(dim=0).mean(dim=0)  # (K,)
+
+            K = scores.shape[0]
+            if S < K:
+                top_idx = torch.topk(scores, S).indices
+                top_idx, _ = torch.sort(top_idx)
+            else:
+                top_idx = torch.arange(K)
+
+            global_idx = top_idx + last_k_start
+
+            k_layer, v_layer = kv[layer_idx]
+            k_sel = k_layer[:, :, global_idx, :].clone().contiguous()
+            v_sel = v_layer[:, :, global_idx, :].clone().contiguous()
+
+            new_kv.append((k_sel.cpu(), v_sel.cpu()))
+
+        # Build DynamicCache-compatible object
+        kv_out = type(kv)()
+        kv_out.key_cache   = [k for k, _ in new_kv]
+        kv_out.value_cache = [v for _, v in new_kv]
+        kv_out._seen_tokens = len(new_kv[0][0][0, 0])
+
+        log_kvs.append(kv_out)
+
+    write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_num}_topS_{S}.pkl')
 
 
 
@@ -404,9 +501,13 @@ if __name__ == '__main__':
   parser.add_argument('-d', '--dataset', type=str)
   args = parser.parse_args()
 
-  # choose one encode-storage strategy from below
-  # default is store_reasoning_offline(args.dataset, last_num=1)
-  store_reasoning_offline(args.dataset, last_num=1)
+  # choose one encode-storage strategy from below :
+  store_reasoning_offline(args.dataset, last_num=1) # default method
   # store_reasoning_last_as_context(args.dataset)
   # store_reasoning_all(args.dataset)
   # store_reasoning_last_action(args.dataset)
+
+  # new implemented methods:
+  # store_reasoning_last_k_actions(args.dataset, last_k=2)
+  # store_reasoning_offline_randomness(args.dataset, last_num=2, S=64)
+  # store_reasoning_offline_topS(args.dataset, last_num=2, S=64)
