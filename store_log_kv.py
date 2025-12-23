@@ -245,6 +245,7 @@ def store_reasoning_last_action(dataset: str):
     input_ids_last = tokenizer.encode(log_last, return_tensors='pt', add_special_tokens=False) # last message
     input_ids_except_last = tokenizer.encode(log_except_last + '\n\n', return_tensors='pt', add_special_tokens=False) # all except last message
 
+    # Find the exact tokens sequence corresponding to the last action inside the last assistant message
     start_idx, end_idx = sublist_indices(input_ids_last[0], input_ids_action[0]) # find the start and end_idx in the last message
     
     # from input_ids_last, find the start and end_idx corresponding to input_ids_action
@@ -279,109 +280,72 @@ def store_reasoning_last_action(dataset: str):
 # --------------------------- NEW IMPLEMENTATION ----------------------------
 # ---------------------------------------------------------------------------
 
-def store_reasoning_last_k_actions(dataset: str, k: int):
-    '''
-    Encode the entire reasoning trace, but store the KV values corresponding
-    to the last k agentic actions in the reasoning trace.
-    '''
+def store_reasoning_last_k_actions(dataset: str, last_k: int):
+  '''Encode all reasoning traces, store the KV values corresponding to the last k agentic actions in the reasoning trace'''
+  # Instead of slicing KV for one [start_idx:end_idx] span, we slice KV for k spans and concatenate them (in order).
 
-    model_id = 'meta-llama/Llama-3.1-8B-Instruct'
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map='auto',
-        torch_dtype=torch.bfloat16
-    )
-    config: LlamaConfig = AutoConfig.from_pretrained(model_id)
-    emb: LlamaRotaryEmbedding = LlamaRotaryEmbedding(config=config).to(
-        device=model.device,
-        dtype=torch.float32
-    )
+  model_id = 'meta-llama/Llama-3.1-8B-Instruct'
+  tokenizer = AutoTokenizer.from_pretrained(model_id)
+  model = AutoModelForCausalLM.from_pretrained(model_id, device_map='auto', torch_dtype=torch.bfloat16)
+  config: LlamaConfig = AutoConfig.from_pretrained(pretrained_model_name_or_path=model_id)
+  emb: LlamaRotaryEmbedding = LlamaRotaryEmbedding(config=config).to(device=model.device, dtype=torch.float32)
 
-    logs = read_json(f'./data/{dataset}/preds/log.json')
-    log_kvs = []
+  logs = read_json(f'./data/{dataset}/preds/log.json')
+  log_kvs = []
 
-    for log in tqdm(logs):
-        # keep only assistant messages
-        assistant_logs = [x for i, x in enumerate(log[0]) if i % 2 == 1]
+  for log in tqdm(logs):
+    log = [x for i, x in enumerate(log[0]) if i % 2 == 1]  # use only assistant messages
+    actions = [extract_action(x).replace('<|eot_id|>', '') for x in log] # extract actions from all assistant messages
 
-        # extract actions from each assistant message
-        actions = [extract_action(x).replace('<|eot_id|>', '') for x in assistant_logs]
+    # keep last k actions
+    actions = [a for a in actions if a.strip() != '']
+    actions = actions[-last_k:]
+    assert len(actions) > 0
 
-        # keep last k actions (skip empty ones just in case)
-        actions = [a for a in actions if a.strip() != '']
-        actions = actions[-k:]
+    log_last = log[-1].replace('<|eot_id|>', '') # rebuild last message so that all actions appear cleanly and once
 
-        assert len(actions) > 0
+    for action in actions:
+      assert len(log_last.rsplit(action, 1)) <= 2
+      if action in log_last:
+        parts = log_last.rsplit(action, 1)
+        log_last = (parts[0].rstrip() + '\n' + action + '\n\n' + parts[1].lstrip())     
 
-        # rebuild reasoning trace with clean action placement
-        rebuilt_logs = []
-        action_spans = []  # (start_idx, end_idx) in token space
+    log_except_last = '\n\n'.join(log[:-1]).replace('<|eot_id|>', '')
+    reasoning_trace = log_except_last + '\n\n' + log_last
+    assert '<|eot_id|>' not in reasoning_trace
 
-        for msg, action in zip(assistant_logs, actions):
-            if action not in msg:
-                continue
+    kv = get_log_kv(reasoning_trace, tokenizer, model, emb) # encode full reasoning trace into KV
+    input_ids_reasoning_trace = tokenizer.encode(reasoning_trace, return_tensors='pt', add_special_tokens=False)[0] # tokenize once for index resolution
 
-        # rebuild full reasoning trace
-        reasoning_trace = '\n\n'.join(
-            [x.replace('<|eot_id|>', '') for x in assistant_logs]
-        )
+    # find token spans for each action
+    spans = []
+    for action in actions:
+      input_ids_action = tokenizer.encode(action + '\n\n', return_tensors='pt', add_special_tokens=False)[0]
+      start_idx, end_idx = sublist_indices(input_ids_reasoning_trace, input_ids_action) # find the start and end_idx in the full reasoning trace for a specific action
+      spans.append((start_idx, end_idx)) # keep the span
 
-        kv = get_log_kv(reasoning_trace, tokenizer, model, emb)
+    kv._seen_tokens = sum(end - start for start, end in spans)  # total number of kept tokens
+    num_layers = len(kv)
+    for layer_idx in range(num_layers):
+      key_chunks = []
+      value_chunks = []
 
-        # tokenize full trace once
-        input_ids_trace = tokenizer.encode(
-            reasoning_trace,
-            return_tensors='pt',
-            add_special_tokens=False
-        )[0]
+      for start_idx, end_idx in spans:
+        key_chunks.append(kv.key_cache[layer_idx][:, :, start_idx:end_idx, :])
+        value_chunks.append(kv.value_cache[layer_idx][:, :, start_idx:end_idx, :])
 
-        kept_spans = []
+      kv.key_cache[layer_idx] = torch.cat(key_chunks, dim=2).clone().contiguous()
+      kv.value_cache[layer_idx] = torch.cat(value_chunks, dim=2).clone().contiguous()
+      assert kv.key_cache[layer_idx].shape == kv.value_cache[layer_idx].shape
+      assert kv.key_cache[layer_idx].shape[2] == kv._seen_tokens
 
-        # find token spans for each of the last k actions
-        for action in actions:
-            action_ids = tokenizer.encode(
-                action + '\n\n',
-                return_tensors='pt',
-                add_special_tokens=False
-            )[0]
+    # move to CPU for storage
+    kv.key_cache = [x.cpu() for x in kv.key_cache]
+    kv.value_cache = [x.cpu() for x in kv.value_cache]
 
-            start_idx, end_idx = sublist_indices(input_ids_trace, action_ids)
-            kept_spans.append((start_idx, end_idx))
+    log_kvs.append(kv)
 
-        # concatenate spans in order
-        total_tokens = sum(end - start for start, end in kept_spans)
-        kv._seen_tokens = total_tokens
-
-        num_layers = len(kv)
-        for layer_idx in range(num_layers):
-            k_chunks = []
-            v_chunks = []
-
-            for start, end in kept_spans:
-                k_chunks.append(
-                    kv.key_cache[layer_idx][:, :, start:end, :]
-                )
-                v_chunks.append(
-                    kv.value_cache[layer_idx][:, :, start:end, :]
-                )
-
-            kv.key_cache[layer_idx] = torch.cat(k_chunks, dim=2).clone().contiguous()
-            kv.value_cache[layer_idx] = torch.cat(v_chunks, dim=2).clone().contiguous()
-
-            assert kv.key_cache[layer_idx].shape[2] == kv._seen_tokens
-
-        # move to CPU for storage
-        kv.key_cache = [x.cpu() for x in kv.key_cache]
-        kv.value_cache = [x.cpu() for x in kv.value_cache]
-
-        log_kvs.append(kv)
-
-    write_pickle(
-        log_kvs,
-        f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{k}_actions.pkl'
-    )
-
+  write_pickle(log_kvs, f'{STORE_PREFIX}/kv/{dataset}/reasoning_last_{last_k}_actions.pkl') # save the KV caches to disk as pickle files
 
 
 
